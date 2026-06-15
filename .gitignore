@@ -1,0 +1,5 @@
+subtrans
+subtrans.exe
+*.srt
+dist/
+.DS_Store
