@@ -107,7 +107,6 @@ func runGUI(args []string) {
 	logs := widget.NewMultiLineEntry()
 	logs.Wrapping = fyne.TextWrapWord
 	logs.SetMinRowsVisible(18)
-	logs.Disable()
 
 	closeButton := widget.NewButton("Close", func() {
 		guiApp.Quit()
@@ -487,7 +486,7 @@ func registerWindowsPath(dir string, stdout io.Writer) error {
 	entries = append(entries, dir)
 	updated := strings.Join(entries, ";")
 
-	cmd := exec.Command("reg", "add", `HKCU\Environment`, "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", updated, "/f")
+	cmd := hiddenCommand("reg", "add", `HKCU\Environment`, "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", updated, "/f")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -499,7 +498,7 @@ func registerWindowsPath(dir string, stdout io.Writer) error {
 }
 
 func currentWindowsUserPath() (string, error) {
-	cmd := exec.Command("reg", "query", `HKCU\Environment`, "/v", "Path")
+	cmd := hiddenCommand("reg", "query", `HKCU\Environment`, "/v", "Path")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", nil
@@ -595,7 +594,7 @@ func executableExists(path string) bool {
 func validFFmpeg(path string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "-version")
+	cmd := hiddenCommandContext(ctx, path, "-version")
 	return cmd.Run() == nil
 }
 
@@ -793,7 +792,7 @@ func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, 
 		tmpPath := tmp.Name()
 		_ = tmp.Close()
 
-		cmd := exec.Command(ffmpegPath, "-y", "-v", "error", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
+		cmd := hiddenCommand(ffmpegPath, "-y", "-v", "error", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
