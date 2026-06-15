@@ -1,6 +1,6 @@
 # subtrans
 
-`subtrans` extracts the first usable subtitle track from video files, translates it, and writes a sidecar subtitle that VLC can auto-load.
+`subtrans` extracts the first usable subtitle track from video files, translates it, and writes a sidecar subtitle that VLC can auto-load. By default it opens a small native graphical window with progress and live logs.
 
 By default it searches the current directory recursively, translates to Hebrew, and writes files like:
 
@@ -28,12 +28,13 @@ Examples:
 ```sh
 subtrans
 subtrans /path/to/videos
+subtrans --cli /path/to/videos
 subtrans -lang fr -overwrite movie.mkv
 subtrans -recursive=false ~/Movies
 subtrans --register
 ```
 
-The command prints timestamped progress logs while it scans, resolves cached `ffmpeg`, extracts subtitles, translates batches, and writes output files.
+The graphical window shows timestamped progress logs while it scans, resolves cached `ffmpeg`, extracts subtitles, translates batches, and writes output files. Use `--cli` to run without the graphical window.
 
 Use `subtrans --register` once to add the executable's directory to your user PATH so future terminals can run `subtrans` from any directory.
 
@@ -45,6 +46,7 @@ Flags:
   -recursive         search subdirectories (default true)
   -overwrite         overwrite existing translated subtitle files
   -register          add this executable's directory to the user PATH and exit
+  -cli               run in command-line mode without opening the graphical log window
   -min-size int      minimum usable extracted subtitle size in bytes (default 32)
   -timeout duration  HTTP translation timeout (default 30s)
   -version           print version

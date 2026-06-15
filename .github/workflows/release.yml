@@ -13,23 +13,17 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  release:
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      previous: ${{ steps.version.outputs.previous }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Test
-        run: go test ./...
 
       - name: Compute next version
         id: version
@@ -53,23 +47,100 @@ jobs:
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "previous=$latest" >> "$GITHUB_OUTPUT"
 
-      - name: Build assets
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up MinGW for Fyne
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build Windows GUI executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags="-s -w -H=windowsgui -X main.version=${{ needs.version.outputs.version }}" -o dist/subtrans-windows-amd64.exe .
+
+      - name: Upload Windows asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtrans-windows-amd64
+          path: dist/subtrans-windows-amd64.exe
+          if-no-files-found: error
+
+  build-macos:
+    needs: version
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build macOS arm64 executable
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-
-          GOOS=windows GOARCH=amd64 go build \
+          GOARCH=arm64 go build \
             -trimpath \
-            -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
-            -o dist/subtrans-windows-amd64.exe .
-
-          GOOS=darwin GOARCH=arm64 go build \
-            -trimpath \
-            -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+            -ldflags="-s -w -X main.version=${{ needs.version.outputs.version }}" \
             -o dist/subtrans-darwin-arm64 .
-
           chmod +x dist/subtrans-darwin-arm64
+
+      - name: Upload macOS asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtrans-darwin-arm64
+          path: dist/subtrans-darwin-arm64
+          if-no-files-found: error
+
+  release:
+    needs:
+      - version
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Generate release notes
         shell: bash
@@ -79,8 +150,8 @@ jobs:
           {
             echo "## Changes"
             echo
-            if [[ -n "${{ steps.version.outputs.previous }}" ]]; then
-              git log --pretty=format:'- %s (%h)' "${{ steps.version.outputs.previous }}..HEAD"
+            if [[ -n "${{ needs.version.outputs.previous }}" ]]; then
+              git log --pretty=format:'- %s (%h)' "${{ needs.version.outputs.previous }}..HEAD"
             else
               git log --pretty=format:'- %s (%h)' HEAD
             fi
@@ -93,8 +164,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.version.outputs.version }}" -m "${{ steps.version.outputs.version }}"
-          git push origin "${{ steps.version.outputs.version }}"
+          git tag -a "${{ needs.version.outputs.version }}" -m "${{ needs.version.outputs.version }}"
+          git push origin "${{ needs.version.outputs.version }}"
 
       - name: Create GitHub release
         env:
@@ -102,8 +173,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "${{ steps.version.outputs.version }}" \
+          gh release create "${{ needs.version.outputs.version }}" \
             dist/subtrans-windows-amd64.exe \
             dist/subtrans-darwin-arm64 \
-            --title "${{ steps.version.outputs.version }}" \
+            --title "${{ needs.version.outputs.version }}" \
             --notes-file RELEASE_NOTES.md

@@ -19,6 +19,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
 )
 
 var version = "dev"
@@ -46,6 +51,7 @@ type options struct {
 	recursive  bool
 	overwrite  bool
 	register   bool
+	cli        bool
 	minSize    int64
 	timeout    time.Duration
 	path       string
@@ -64,8 +70,100 @@ type translateClient struct {
 }
 
 func main() {
+	if shouldRunGUI(os.Args[1:]) {
+		runGUI(os.Args[1:])
+		return
+	}
 	code := run(os.Args[1:], os.Stdout, os.Stderr)
 	os.Exit(code)
+}
+
+func shouldRunGUI(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "-cli", "--cli", "-register", "--register", "-version", "--version", "-h", "--help":
+			return false
+		}
+		if strings.HasPrefix(arg, "-cli=") || strings.HasPrefix(arg, "--cli=") ||
+			strings.HasPrefix(arg, "-register=") || strings.HasPrefix(arg, "--register=") ||
+			strings.HasPrefix(arg, "-version=") || strings.HasPrefix(arg, "--version=") {
+			return false
+		}
+	}
+	return true
+}
+
+func runGUI(args []string) {
+	guiApp := app.NewWithID("com.github.amitbet.subtrans")
+	window := guiApp.NewWindow("Subtrans")
+	window.Resize(fyne.NewSize(760, 520))
+
+	status := widget.NewLabel("Running...")
+	status.TextStyle = fyne.TextStyle{Bold: true}
+
+	progress := widget.NewProgressBarInfinite()
+	logs := widget.NewMultiLineEntry()
+	logs.Wrapping = fyne.TextWrapWord
+	logs.SetMinRowsVisible(18)
+	logs.Disable()
+
+	closeButton := widget.NewButton("Close", func() {
+		guiApp.Quit()
+	})
+	closeButton.Disable()
+
+	content := container.NewBorder(
+		container.NewVBox(status, progress),
+		container.NewHBox(closeButton),
+		nil,
+		nil,
+		logs,
+	)
+	window.SetContent(content)
+
+	writer := newGUILogWriter(logs)
+	done := make(chan int, 1)
+	go func() {
+		done <- run(args, writer, writer)
+	}()
+	go func() {
+		code := <-done
+		fyne.Do(func() {
+			progress.Stop()
+			if code == 0 {
+				status.SetText("Completed successfully")
+			} else {
+				status.SetText(fmt.Sprintf("Completed with errors (exit code %d)", code))
+			}
+			closeButton.Enable()
+		})
+	}()
+
+	window.ShowAndRun()
+}
+
+type guiLogWriter struct {
+	entry *widget.Entry
+	lines []string
+}
+
+func newGUILogWriter(entry *widget.Entry) *guiLogWriter {
+	return &guiLogWriter{entry: entry}
+}
+
+func (w *guiLogWriter) Write(p []byte) (int, error) {
+	text := string(p)
+	fyne.Do(func() {
+		w.lines = append(w.lines, text)
+		if len(w.lines) > 1200 {
+			w.lines = w.lines[len(w.lines)-1200:]
+		}
+		w.entry.SetText(strings.Join(w.lines, ""))
+		w.entry.CursorRow = strings.Count(w.entry.Text, "\n")
+		w.entry.CursorColumn = 0
+		w.entry.Refresh()
+	})
+	return len(p), nil
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -138,6 +236,7 @@ func parseOptions(args []string) (options, error) {
 	fs.BoolVar(&opts.recursive, "recursive", true, "search subdirectories")
 	fs.BoolVar(&opts.overwrite, "overwrite", false, "overwrite existing translated subtitle files")
 	fs.BoolVar(&opts.register, "register", false, "add this executable's directory to the user PATH and exit")
+	fs.BoolVar(&opts.cli, "cli", false, "run in command-line mode without opening the graphical log window")
 	fs.Int64Var(&opts.minSize, "min-size", 32, "minimum extracted subtitle size in bytes before trying the next subtitle track")
 	fs.DurationVar(&opts.timeout, "timeout", 30*time.Second, "HTTP translation timeout")
 	showVersion := fs.Bool("version", false, "print version")
@@ -181,6 +280,7 @@ Flags:
   -recursive         search subdirectories (default true)
   -overwrite         overwrite existing translated subtitle files
   -register          add this executable's directory to the user PATH and exit
+  -cli               run in command-line mode without opening the graphical log window
   -min-size int      minimum usable extracted subtitle size in bytes (default 32)
   -timeout duration  HTTP translation timeout (default 30s)
   -version           print version`)
