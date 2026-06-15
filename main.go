@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,15 +21,18 @@ import (
 	"strings"
 	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/widget"
+	"github.com/wailsapp/wails/v2"
+	wailsoptions "github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 var version = "dev"
 
 const ffmpegStaticVersion = "b6.1.2-rc.1"
+
+//go:embed all:frontend/dist
+var frontendAssets embed.FS
 
 var videoExtensions = map[string]bool{
 	".3gp":  true,
@@ -94,104 +98,150 @@ func shouldRunGUI(args []string) bool {
 }
 
 func runGUI(args []string) {
-	guiApp := app.NewWithID("com.github.amitbet.subtrans")
-	window := guiApp.NewWindow("Subtrans")
-	window.Resize(fyne.NewSize(760, 520))
-
-	status := widget.NewLabel("Running...")
-	status.TextStyle = fyne.TextStyle{Bold: true}
-	hint := widget.NewLabel("Drop video files or folders here to process them. Existing target subtitles are skipped unless -overwrite is set.")
-	hint.Wrapping = fyne.TextWrapWord
-
-	progress := widget.NewProgressBarInfinite()
-	logs := widget.NewMultiLineEntry()
-	logs.Wrapping = fyne.TextWrapWord
-	logs.SetMinRowsVisible(18)
-
-	closeButton := widget.NewButton("Close", func() {
-		guiApp.Quit()
-	})
-	closeButton.Disable()
-
-	content := container.NewBorder(
-		container.NewVBox(status, hint, progress),
-		container.NewHBox(closeButton),
-		nil,
-		nil,
-		logs,
-	)
-	window.SetContent(content)
-
-	writer := newGUILogWriter(logs)
-	processing := make(chan struct{}, 1)
-	startRun := func(runFunc func() int) {
-		select {
-		case processing <- struct{}{}:
-		default:
-			_, _ = writer.Write([]byte("Already processing; drop ignored until the current run finishes.\n"))
-			return
-		}
-		fyne.Do(func() {
-			status.SetText("Running...")
-			progress.Start()
-			closeButton.Disable()
-		})
-		go func() {
-			code := runFunc()
-			fyne.Do(func() {
-				progress.Stop()
-				if code == 0 {
-					status.SetText("Completed successfully")
-				} else {
-					status.SetText(fmt.Sprintf("Completed with errors (exit code %d)", code))
-				}
-				closeButton.Enable()
-			})
-			<-processing
-		}()
+	guiApp := newWailsGUI(args)
+	if err := wails.Run(&wailsoptions.App{
+		Title:     "Subtrans",
+		Width:     980,
+		Height:    680,
+		MinWidth:  820,
+		MinHeight: 560,
+		AssetServer: &assetserver.Options{
+			Assets: frontendAssets,
+		},
+		OnStartup: guiApp.startup,
+		DragAndDrop: &wailsoptions.DragAndDrop{
+			EnableFileDrop:     true,
+			DisableWebViewDrop: true,
+		},
+		BackgroundColour: wailsoptions.NewRGB(246, 247, 251),
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	window.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
-		paths := droppedPaths(uris)
-		if len(paths) == 0 {
-			_, _ = writer.Write([]byte("Drop ignored; no local video file or folder was found.\n"))
-			return
-		}
-		opts, err := parseOptions(args)
-		if err != nil {
-			_, _ = writer.Write([]byte(fmt.Sprintf("Drop ignored; current options are invalid: %v\n", err)))
-			return
-		}
-		startRun(func() int {
-			failures := 0
-			for _, path := range paths {
-				if code := run(argsForPath(opts, path), writer, writer); code != 0 {
-					failures++
-				}
-			}
-			if failures > 0 {
-				return 1
-			}
-			return 0
-		})
-	})
-
-	startRun(func() int {
-		return run(args, writer, writer)
-	})
-	window.ShowAndRun()
 }
 
-func droppedPaths(uris []fyne.URI) []string {
-	paths := make([]string, 0, len(uris))
-	for _, uri := range uris {
-		if uri.Scheme() != "file" {
-			continue
+type runEvents struct {
+	setQueue     func([]string)
+	removeQueued func(string)
+}
+
+type wailsGUI struct {
+	ctx        context.Context
+	args       []string
+	processing chan struct{}
+}
+
+func newWailsGUI(args []string) *wailsGUI {
+	return &wailsGUI{
+		args:       append([]string(nil), args...),
+		processing: make(chan struct{}, 1),
+	}
+}
+
+func (g *wailsGUI) startup(ctx context.Context) {
+	g.ctx = ctx
+	wailsruntime.OnFileDrop(ctx, func(_ int, _ int, paths []string) {
+		g.processDroppedPaths(paths)
+	})
+	g.startRun(func(writer io.Writer, events runEvents) int {
+		return runWithEvents(g.args, writer, writer, events)
+	})
+}
+
+func (g *wailsGUI) processDroppedPaths(paths []string) {
+	paths = filterDroppedPaths(paths)
+	if len(paths) == 0 {
+		g.emitLog("Drop ignored; no local video file or folder was found.\n")
+		return
+	}
+	opts, err := parseOptions(g.args)
+	if err != nil {
+		g.emitLog(fmt.Sprintf("Drop ignored; current options are invalid: %v\n", err))
+		return
+	}
+	g.startRun(func(writer io.Writer, events runEvents) int {
+		failures := 0
+		for _, path := range paths {
+			if code := runWithEvents(argsForPath(opts, path), writer, writer, events); code != 0 {
+				failures++
+			}
 		}
-		path := uri.Path()
-		if runtime.GOOS == "windows" && len(path) >= 3 && path[0] == '/' && path[2] == ':' {
-			path = path[1:]
+		if failures > 0 {
+			return 1
 		}
-		path = filepath.FromSlash(path)
+		return 0
+	})
+}
+
+func (g *wailsGUI) startRun(runFunc func(io.Writer, runEvents) int) {
+	select {
+	case g.processing <- struct{}{}:
+	default:
+		g.emitLog("Already processing; drop ignored until the current run finishes.\n")
+		return
+	}
+
+	g.emitStatus("Running...", true, 0)
+	writer := wailsLogWriter{emit: g.emitLog}
+	events := runEvents{
+		setQueue:     g.emitQueueSet,
+		removeQueued: g.emitQueueRemove,
+	}
+	go func() {
+		code := runFunc(writer, events)
+		if code == 0 {
+			g.emitStatus("Completed successfully", false, code)
+		} else {
+			g.emitStatus(fmt.Sprintf("Completed with errors (exit code %d)", code), false, code)
+		}
+		<-g.processing
+	}()
+}
+
+func (g *wailsGUI) emitStatus(message string, running bool, code int) {
+	if g.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(g.ctx, "subtrans:status", map[string]any{
+		"message": message,
+		"running": running,
+		"code":    code,
+	})
+}
+
+func (g *wailsGUI) emitLog(message string) {
+	if g.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(g.ctx, "subtrans:log", message)
+}
+
+func (g *wailsGUI) emitQueueSet(paths []string) {
+	if g.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(g.ctx, "subtrans:queue:set", paths)
+}
+
+func (g *wailsGUI) emitQueueRemove(path string) {
+	if g.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(g.ctx, "subtrans:queue:remove", path)
+}
+
+type wailsLogWriter struct {
+	emit func(string)
+}
+
+func (w wailsLogWriter) Write(p []byte) (int, error) {
+	w.emit(string(p))
+	return len(p), nil
+}
+
+func filterDroppedPaths(paths []string) []string {
+	filtered := make([]string, 0, len(paths))
+	for _, path := range paths {
 		if path == "" {
 			continue
 		}
@@ -200,10 +250,10 @@ func droppedPaths(uris []fyne.URI) []string {
 			continue
 		}
 		if info.IsDir() || isVideo(path) {
-			paths = append(paths, path)
+			filtered = append(filtered, path)
 		}
 	}
-	return paths
+	return filtered
 }
 
 func argsForPath(opts options, path string) []string {
@@ -222,31 +272,11 @@ func argsForPath(opts options, path string) []string {
 	return append(args, path)
 }
 
-type guiLogWriter struct {
-	entry *widget.Entry
-	lines []string
-}
-
-func newGUILogWriter(entry *widget.Entry) *guiLogWriter {
-	return &guiLogWriter{entry: entry}
-}
-
-func (w *guiLogWriter) Write(p []byte) (int, error) {
-	text := string(p)
-	fyne.Do(func() {
-		w.lines = append(w.lines, text)
-		if len(w.lines) > 1200 {
-			w.lines = w.lines[len(w.lines)-1200:]
-		}
-		w.entry.SetText(strings.Join(w.lines, ""))
-		w.entry.CursorRow = strings.Count(w.entry.Text, "\n")
-		w.entry.CursorColumn = 0
-		w.entry.Refresh()
-	})
-	return len(p), nil
-}
-
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithEvents(args, stdout, stderr, runEvents{})
+}
+
+func runWithEvents(args []string, stdout, stderr io.Writer, events runEvents) int {
 	opts, err := parseOptions(args)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -271,13 +301,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(videos) == 0 {
 		logf(stdout, "No video files found.")
+		if events.setQueue != nil {
+			events.setQueue(nil)
+		}
 		return 0
 	}
 	logf(stdout, "Found %d video file(s).", len(videos))
+	if events.setQueue != nil {
+		events.setQueue(videos)
+	}
 
 	ffmpegPath, err := resolveFFmpeg(stdout)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
+		if events.setQueue != nil {
+			events.setQueue(nil)
+		}
 		return 1
 	}
 
@@ -294,9 +333,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 			failures++
 			fmt.Fprintf(stderr, "%s: %v\n", video, err)
 			logf(stdout, "Failed %d/%d: %s", i+1, len(videos), video)
+			if events.removeQueued != nil {
+				events.removeQueued(video)
+			}
 			continue
 		}
 		logf(stdout, "Finished %d/%d: %s", i+1, len(videos), video)
+		if events.removeQueued != nil {
+			events.removeQueued(video)
+		}
 	}
 	if failures > 0 {
 		fmt.Fprintf(stderr, "Completed with %d failure(s).\n", failures)

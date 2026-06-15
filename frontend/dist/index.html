@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Subtrans</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell" id="drop-zone">
+      <section class="topbar">
+        <div>
+          <h1>Subtrans</h1>
+          <p>Drop video files or folders anywhere in this window.</p>
+        </div>
+        <div class="status">
+          <span id="spinner" class="spinner hidden" aria-hidden="true"></span>
+          <span id="status-text">Starting...</span>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="queue-panel">
+          <div class="panel-header">
+            <h2>Queue</h2>
+            <span id="queue-count">0</span>
+          </div>
+          <ul id="queue-list" class="queue-list">
+            <li class="empty">No queued videos</li>
+          </ul>
+        </aside>
+
+        <section class="log-panel">
+          <div class="panel-header">
+            <h2>Logs</h2>
+          </div>
+          <pre id="logs"></pre>
+        </section>
+      </section>
+    </main>
+    <script src="./main.js"></script>
+  </body>
+</html>
