@@ -32,6 +32,8 @@ subtrans -lang fr -overwrite movie.mkv
 subtrans -recursive=false ~/Movies
 ```
 
+The command prints timestamped progress logs while it scans, resolves `ffmpeg`, probes subtitle streams, extracts subtitles, translates batches, and writes output files.
+
 Flags:
 
 ```text

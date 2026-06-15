@@ -90,15 +90,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	logf(stdout, "Starting subtrans %s", version)
+	logf(stdout, "Target: path=%q source=%s target=%s recursive=%t overwrite=%t min-size=%d", opts.path, opts.sourceLang, opts.targetLang, opts.recursive, opts.overwrite, opts.minSize)
+	logf(stdout, "Scanning for video files...")
 	videos, err := findVideos(opts.path, opts.recursive)
 	if err != nil {
 		fmt.Fprintf(stderr, "find videos: %v\n", err)
 		return 1
 	}
 	if len(videos) == 0 {
-		fmt.Fprintln(stdout, "No video files found.")
+		logf(stdout, "No video files found.")
 		return 0
 	}
+	logf(stdout, "Found %d video file(s).", len(videos))
 
 	tools, err := resolveMediaTools(stdout)
 	if err != nil {
@@ -113,16 +117,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	failures := 0
-	for _, video := range videos {
+	for i, video := range videos {
+		logf(stdout, "Processing %d/%d: %s", i+1, len(videos), video)
 		if err := processVideo(video, opts, translator, tools, stdout); err != nil {
 			failures++
 			fmt.Fprintf(stderr, "%s: %v\n", video, err)
+			logf(stdout, "Failed %d/%d: %s", i+1, len(videos), video)
+			continue
 		}
+		logf(stdout, "Finished %d/%d: %s", i+1, len(videos), video)
 	}
 	if failures > 0 {
 		fmt.Fprintf(stderr, "Completed with %d failure(s).\n", failures)
 		return 1
 	}
+	logf(stdout, "Completed successfully.")
 	return 0
 }
 
@@ -182,14 +191,24 @@ Flags:
   -version           print version`)
 }
 
+func logf(w io.Writer, format string, args ...any) {
+	fmt.Fprintf(w, "[%s] ", time.Now().Format("15:04:05"))
+	fmt.Fprintf(w, format, args...)
+	fmt.Fprintln(w)
+}
+
 func resolveMediaTools(stdout io.Writer) (mediaTools, error) {
+	logf(stdout, "Resolving ffmpeg tools...")
 	if tools, ok := bundledMediaTools(); ok {
+		logf(stdout, "Using bundled ffmpeg tools: ffmpeg=%s ffprobe=%s", tools.ffmpeg, tools.ffprobe)
 		return tools, nil
 	}
 	if tools, ok := cachedMediaTools(); ok {
+		logf(stdout, "Using cached ffmpeg tools: ffmpeg=%s ffprobe=%s", tools.ffmpeg, tools.ffprobe)
 		return tools, nil
 	}
 	if tools, err := pathMediaTools(); err == nil {
+		logf(stdout, "Using ffmpeg tools from PATH: ffmpeg=%s ffprobe=%s", tools.ffmpeg, tools.ffprobe)
 		return tools, nil
 	}
 
@@ -205,13 +224,17 @@ func resolveMediaTools(stdout io.Writer) (mediaTools, error) {
 		return mediaTools{}, err
 	}
 
-	fmt.Fprintf(stdout, "Downloading ffmpeg tools for %s/%s...\n", runtime.GOOS, runtime.GOARCH)
+	logf(stdout, "No ffmpeg tools found locally; downloading for %s/%s.", runtime.GOOS, runtime.GOARCH)
+	logf(stdout, "Downloading ffmpeg from %s", urls.ffmpeg)
 	if err := downloadExecutable(urls.ffmpeg, tools.ffmpeg); err != nil {
 		return mediaTools{}, fmt.Errorf("download ffmpeg: %w", err)
 	}
+	logf(stdout, "Installed ffmpeg at %s", tools.ffmpeg)
+	logf(stdout, "Downloading ffprobe from %s", urls.ffprobe)
 	if err := downloadExecutable(urls.ffprobe, tools.ffprobe); err != nil {
 		return mediaTools{}, fmt.Errorf("download ffprobe: %w", err)
 	}
+	logf(stdout, "Installed ffprobe at %s", tools.ffprobe)
 	return tools, nil
 }
 
@@ -397,15 +420,17 @@ func isVideo(path string) bool {
 
 func processVideo(video string, opts options, translator translateClient, tools mediaTools, stdout io.Writer) error {
 	output := subtitleOutputPath(video, opts.targetLang)
+	logf(stdout, "Output subtitle path: %s", output)
 	if !opts.overwrite {
 		if _, err := os.Stat(output); err == nil {
-			fmt.Fprintf(stdout, "Skipping %s, %s already exists.\n", video, output)
+			logf(stdout, "Skipping; output already exists: %s", output)
 			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
 
+	logf(stdout, "Probing subtitle streams...")
 	streams, err := subtitleStreams(video, tools)
 	if err != nil {
 		return err
@@ -413,13 +438,15 @@ func processVideo(video string, opts options, translator translateClient, tools 
 	if len(streams) == 0 {
 		return errors.New("no subtitle tracks found")
 	}
+	logf(stdout, "Found %d subtitle stream(s): %s", len(streams), streamList(streams))
 
-	extracted, stream, err := extractFirstUsableSubtitle(video, streams, opts.minSize, tools)
+	extracted, stream, err := extractFirstUsableSubtitle(video, streams, opts.minSize, tools, stdout)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(extracted)
 
+	logf(stdout, "Reading extracted subtitle: %s", extracted)
 	content, err := os.ReadFile(extracted)
 	if err != nil {
 		return err
@@ -431,20 +458,17 @@ func processVideo(video string, opts options, translator translateClient, tools 
 	if len(cues) == 0 {
 		return errors.New("extracted subtitle contains no cues")
 	}
+	logf(stdout, "Parsed %d subtitle cue(s).", len(cues))
 
-	fmt.Fprintf(stdout, "Translating %s using subtitle stream #%d", video, stream.Index)
-	if lang := stream.Tags["language"]; lang != "" {
-		fmt.Fprintf(stdout, " (%s)", lang)
-	}
-	fmt.Fprintln(stdout, "...")
-
-	if err := translateCues(context.Background(), translator, cues); err != nil {
+	logf(stdout, "Translating with subtitle stream #%d (%s).", stream.Index, streamDescription(stream))
+	if err := translateCues(context.Background(), translator, cues, stdout); err != nil {
 		return err
 	}
+	logf(stdout, "Writing translated subtitle...")
 	if err := os.WriteFile(output, []byte(renderSRT(cues)), 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Wrote %s\n", output)
+	logf(stdout, "Wrote %s", output)
 	return nil
 }
 
@@ -471,9 +495,10 @@ func subtitleStreams(video string, tools mediaTools) ([]probeStream, error) {
 	return result.Streams, nil
 }
 
-func extractFirstUsableSubtitle(video string, streams []probeStream, minSize int64, tools mediaTools) (string, probeStream, error) {
+func extractFirstUsableSubtitle(video string, streams []probeStream, minSize int64, tools mediaTools, stdout io.Writer) (string, probeStream, error) {
 	var lastErr error
 	for _, stream := range streams {
+		logf(stdout, "Trying subtitle stream #%d (%s).", stream.Index, streamDescription(stream))
 		tmp, err := os.CreateTemp("", "subtrans-*.srt")
 		if err != nil {
 			return "", probeStream{}, err
@@ -487,6 +512,7 @@ func extractFirstUsableSubtitle(video string, streams []probeStream, minSize int
 		if err := cmd.Run(); err != nil {
 			_ = os.Remove(tmpPath)
 			lastErr = fmt.Errorf("stream #%d extraction failed: %w: %s", stream.Index, err, strings.TrimSpace(stderr.String()))
+			logf(stdout, "Stream #%d extraction failed; trying next subtitle stream.", stream.Index)
 			continue
 		}
 
@@ -499,14 +525,41 @@ func extractFirstUsableSubtitle(video string, streams []probeStream, minSize int
 		if info.Size() <= minSize {
 			_ = os.Remove(tmpPath)
 			lastErr = fmt.Errorf("stream #%d extracted subtitle too small (%d bytes)", stream.Index, info.Size())
+			logf(stdout, "Stream #%d extracted %d bytes, below min-size %d; trying next subtitle stream.", stream.Index, info.Size(), minSize)
 			continue
 		}
+		logf(stdout, "Selected subtitle stream #%d; extracted %d bytes.", stream.Index, info.Size())
 		return tmpPath, stream, nil
 	}
 	if lastErr != nil {
 		return "", probeStream{}, fmt.Errorf("no usable subtitle track found: %w", lastErr)
 	}
 	return "", probeStream{}, errors.New("no usable subtitle track found")
+}
+
+func streamList(streams []probeStream) string {
+	parts := make([]string, 0, len(streams))
+	for _, stream := range streams {
+		parts = append(parts, fmt.Sprintf("#%d %s", stream.Index, streamDescription(stream)))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func streamDescription(stream probeStream) string {
+	values := []string{}
+	if stream.CodecName != "" {
+		values = append(values, "codec="+stream.CodecName)
+	}
+	if lang := stream.Tags["language"]; lang != "" {
+		values = append(values, "lang="+lang)
+	}
+	if title := stream.Tags["title"]; title != "" {
+		values = append(values, "title="+title)
+	}
+	if len(values) == 0 {
+		return "unknown metadata"
+	}
+	return strings.Join(values, " ")
 }
 
 func parseSRT(input string) ([]cue, error) {
@@ -543,7 +596,7 @@ func parseSRT(input string) ([]cue, error) {
 	return cues, nil
 }
 
-func translateCues(ctx context.Context, translator translateClient, cues []cue) error {
+func translateCues(ctx context.Context, translator translateClient, cues []cue, stdout io.Writer) error {
 	const maxBatchChars = 3500
 	const delimiter = "\n\n<<<SUBTRANS_BREAK>>>\n\n"
 
@@ -553,11 +606,23 @@ func translateCues(ctx context.Context, translator translateClient, cues []cue) 
 	}
 	var batch []item
 	batchChars := 0
+	batchNumber := 0
+	nonEmptyCues := 0
+	for i := range cues {
+		if strings.TrimSpace(strings.Join(cues[i].Text, "\n")) != "" {
+			nonEmptyCues++
+		}
+	}
+	logf(stdout, "Translating %d non-empty cue(s) from %s to %s.", nonEmptyCues, translator.source, translator.target)
 
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
+		batchNumber++
+		firstCue := batch[0].index + 1
+		lastCue := batch[len(batch)-1].index + 1
+		logf(stdout, "Translating batch %d: cues %d-%d (%d cue(s), %d chars).", batchNumber, firstCue, lastCue, len(batch), batchChars)
 		parts := make([]string, len(batch))
 		for i, item := range batch {
 			parts[i] = item.text
@@ -571,8 +636,10 @@ func translateCues(ctx context.Context, translator translateClient, cues []cue) 
 			translatedParts = strings.Split(translated, "<<<SUBTRANS_BREAK>>>")
 		}
 		if len(translatedParts) != len(batch) {
+			logf(stdout, "Batch %d could not be split safely; retrying cue-by-cue.", batchNumber)
 			translatedParts = nil
 			for _, item := range batch {
+				logf(stdout, "Translating cue %d individually.", item.index+1)
 				translatedOne, err := translator.translate(ctx, item.text)
 				if err != nil {
 					return err
@@ -585,6 +652,7 @@ func translateCues(ctx context.Context, translator translateClient, cues []cue) 
 		}
 		batch = nil
 		batchChars = 0
+		logf(stdout, "Finished batch %d.", batchNumber)
 		return nil
 	}
 
