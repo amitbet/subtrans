@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2"
@@ -122,6 +123,7 @@ func runGUI(args []string) {
 
 type runEvents struct {
 	setQueue     func([]string)
+	markActive   func(string)
 	removeQueued func(string)
 }
 
@@ -129,6 +131,7 @@ type wailsGUI struct {
 	ctx        context.Context
 	args       []string
 	processing chan struct{}
+	startOnce  sync.Once
 }
 
 func newWailsGUI(args []string) *wailsGUI {
@@ -143,8 +146,16 @@ func (g *wailsGUI) startup(ctx context.Context) {
 	wailsruntime.OnFileDrop(ctx, func(_ int, _ int, paths []string) {
 		g.processDroppedPaths(paths)
 	})
-	g.startRun(func(writer io.Writer, events runEvents) int {
-		return runWithEvents(g.args, writer, writer, events)
+	// Wait for the frontend to register its event listeners before kicking
+	// off the initial run; otherwise the early status/queue events are emitted
+	// to nobody and the queue never appears. The frontend emits this once it
+	// has subscribed via window.runtime.EventsOn.
+	wailsruntime.EventsOn(ctx, "subtrans:ready", func(...interface{}) {
+		g.startOnce.Do(func() {
+			g.startRun(func(writer io.Writer, events runEvents) int {
+				return runWithEvents(g.args, writer, writer, events)
+			})
+		})
 	})
 }
 
@@ -185,6 +196,7 @@ func (g *wailsGUI) startRun(runFunc func(io.Writer, runEvents) int) {
 	writer := wailsLogWriter{emit: g.emitLog}
 	events := runEvents{
 		setQueue:     g.emitQueueSet,
+		markActive:   g.emitQueueActive,
 		removeQueued: g.emitQueueRemove,
 	}
 	go func() {
@@ -221,6 +233,13 @@ func (g *wailsGUI) emitQueueSet(paths []string) {
 		return
 	}
 	wailsruntime.EventsEmit(g.ctx, "subtrans:queue:set", paths)
+}
+
+func (g *wailsGUI) emitQueueActive(path string) {
+	if g.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(g.ctx, "subtrans:queue:active", path)
 }
 
 func (g *wailsGUI) emitQueueRemove(path string) {
@@ -329,6 +348,9 @@ func runWithEvents(args []string, stdout, stderr io.Writer, events runEvents) in
 	failures := 0
 	for i, video := range videos {
 		logf(stdout, "Processing %d/%d: %s", i+1, len(videos), video)
+		if events.markActive != nil {
+			events.markActive(video)
+		}
 		if err := processVideo(video, opts, translator, ffmpegPath, stdout); err != nil {
 			failures++
 			fmt.Fprintf(stderr, "%s: %v\n", video, err)
