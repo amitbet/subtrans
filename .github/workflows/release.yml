@@ -51,32 +51,41 @@ jobs:
           fi
 
           echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "previous=$latest" >> "$GITHUB_OUTPUT"
 
       - name: Build assets
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/subtrans-windows-amd64/ffmpeg dist/subtrans-darwin-arm64/ffmpeg
+          mkdir -p dist
 
           GOOS=windows GOARCH=amd64 go build \
             -trimpath \
             -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
-            -o dist/subtrans-windows-amd64/subtrans.exe .
+            -o dist/subtrans-windows-amd64.exe .
 
           GOOS=darwin GOARCH=arm64 go build \
             -trimpath \
             -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
-            -o dist/subtrans-darwin-arm64/subtrans .
+            -o dist/subtrans-darwin-arm64 .
 
-          base="https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/b6.1.2-rc.1"
-          curl -fsSL "$base/ffmpeg-win32-x64" -o dist/subtrans-windows-amd64/ffmpeg/ffmpeg.exe
-          curl -fsSL "$base/ffprobe-win32-x64" -o dist/subtrans-windows-amd64/ffmpeg/ffprobe.exe
-          curl -fsSL "$base/ffmpeg-darwin-arm64" -o dist/subtrans-darwin-arm64/ffmpeg/ffmpeg
-          curl -fsSL "$base/ffprobe-darwin-arm64" -o dist/subtrans-darwin-arm64/ffmpeg/ffprobe
-          chmod +x dist/subtrans-darwin-arm64/subtrans dist/subtrans-darwin-arm64/ffmpeg/ffmpeg dist/subtrans-darwin-arm64/ffmpeg/ffprobe
+          chmod +x dist/subtrans-darwin-arm64
 
-          (cd dist && zip -qr subtrans-windows-amd64.zip subtrans-windows-amd64)
-          (cd dist && tar -czf subtrans-darwin-arm64.tar.gz subtrans-darwin-arm64)
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Changes"
+            echo
+            if [[ -n "${{ steps.version.outputs.previous }}" ]]; then
+              git log --pretty=format:'- %s (%h)' "${{ steps.version.outputs.previous }}..HEAD"
+            else
+              git log --pretty=format:'- %s (%h)' HEAD
+            fi
+            echo
+          } > RELEASE_NOTES.md
 
       - name: Create tag
         shell: bash
@@ -94,7 +103,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "${{ steps.version.outputs.version }}" \
-            dist/subtrans-windows-amd64.zip \
-            dist/subtrans-darwin-arm64.tar.gz \
+            dist/subtrans-windows-amd64.exe \
+            dist/subtrans-darwin-arm64 \
             --title "${{ steps.version.outputs.version }}" \
-            --notes "Automated release for ${{ steps.version.outputs.version }}."
+            --notes-file RELEASE_NOTES.md

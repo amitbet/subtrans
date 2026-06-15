@@ -43,3 +43,30 @@ func TestSubtitleOutputPath(t *testing.T) {
 		}
 	}
 }
+
+func TestUpsertMarkedBlock(t *testing.T) {
+	content := "existing=true\n"
+	block := "export PATH='/opt/subtrans':$PATH\n"
+
+	updated, changed := upsertMarkedBlock(content, "subtrans register", block)
+	if !changed {
+		t.Fatal("upsertMarkedBlock() changed = false, want true")
+	}
+	if !strings.Contains(updated, "# >>> subtrans register >>>\n"+block+"# <<< subtrans register <<<") {
+		t.Fatalf("updated content missing marked block:\n%s", updated)
+	}
+
+	again, changed := upsertMarkedBlock(updated, "subtrans register", block)
+	if changed {
+		t.Fatal("second upsertMarkedBlock() changed = true, want false")
+	}
+	if again != updated {
+		t.Fatal("second upsertMarkedBlock() changed content unexpectedly")
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("/tmp/has space/it's"); got != "'/tmp/has space/it'\"'\"'s'" {
+		t.Fatalf("shellQuote() = %q", got)
+	}
+}

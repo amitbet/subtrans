@@ -45,25 +45,10 @@ type options struct {
 	sourceLang string
 	recursive  bool
 	overwrite  bool
+	register   bool
 	minSize    int64
 	timeout    time.Duration
 	path       string
-}
-
-type mediaTools struct {
-	ffmpeg  string
-	ffprobe string
-}
-
-type probeResult struct {
-	Streams []probeStream `json:"streams"`
-}
-
-type probeStream struct {
-	Index     int               `json:"index"`
-	CodecType string            `json:"codec_type"`
-	CodecName string            `json:"codec_name"`
-	Tags      map[string]string `json:"tags"`
 }
 
 type cue struct {
@@ -90,6 +75,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	if opts.register {
+		if err := registerExecutableDir(stdout); err != nil {
+			fmt.Fprintf(stderr, "register: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	logf(stdout, "Starting subtrans %s", version)
 	logf(stdout, "Target: path=%q source=%s target=%s recursive=%t overwrite=%t min-size=%d", opts.path, opts.sourceLang, opts.targetLang, opts.recursive, opts.overwrite, opts.minSize)
 	logf(stdout, "Scanning for video files...")
@@ -104,7 +97,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	logf(stdout, "Found %d video file(s).", len(videos))
 
-	tools, err := resolveMediaTools(stdout)
+	ffmpegPath, err := resolveFFmpeg(stdout)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -119,7 +112,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	failures := 0
 	for i, video := range videos {
 		logf(stdout, "Processing %d/%d: %s", i+1, len(videos), video)
-		if err := processVideo(video, opts, translator, tools, stdout); err != nil {
+		if err := processVideo(video, opts, translator, ffmpegPath, stdout); err != nil {
 			failures++
 			fmt.Fprintf(stderr, "%s: %v\n", video, err)
 			logf(stdout, "Failed %d/%d: %s", i+1, len(videos), video)
@@ -144,6 +137,7 @@ func parseOptions(args []string) (options, error) {
 	fs.StringVar(&opts.sourceLang, "source", "auto", "source language code")
 	fs.BoolVar(&opts.recursive, "recursive", true, "search subdirectories")
 	fs.BoolVar(&opts.overwrite, "overwrite", false, "overwrite existing translated subtitle files")
+	fs.BoolVar(&opts.register, "register", false, "add this executable's directory to the user PATH and exit")
 	fs.Int64Var(&opts.minSize, "min-size", 32, "minimum extracted subtitle size in bytes before trying the next subtitle track")
 	fs.DurationVar(&opts.timeout, "timeout", 30*time.Second, "HTTP translation timeout")
 	showVersion := fs.Bool("version", false, "print version")
@@ -186,6 +180,7 @@ Flags:
   -source string     source language code (default "auto")
   -recursive         search subdirectories (default true)
   -overwrite         overwrite existing translated subtitle files
+  -register          add this executable's directory to the user PATH and exit
   -min-size int      minimum usable extracted subtitle size in bytes (default 32)
   -timeout duration  HTTP translation timeout (default 30s)
   -version           print version`)
@@ -197,92 +192,230 @@ func logf(w io.Writer, format string, args ...any) {
 	fmt.Fprintln(w)
 }
 
-func resolveMediaTools(stdout io.Writer) (mediaTools, error) {
-	logf(stdout, "Resolving ffmpeg tools...")
-	if tools, ok := bundledMediaTools(); ok {
-		logf(stdout, "Using bundled ffmpeg tools: ffmpeg=%s ffprobe=%s", tools.ffmpeg, tools.ffprobe)
-		return tools, nil
-	}
-	if tools, ok := cachedMediaTools(); ok {
-		logf(stdout, "Using cached ffmpeg tools: ffmpeg=%s ffprobe=%s", tools.ffmpeg, tools.ffprobe)
-		return tools, nil
-	}
-	if tools, err := pathMediaTools(); err == nil {
-		logf(stdout, "Using ffmpeg tools from PATH: ffmpeg=%s ffprobe=%s", tools.ffmpeg, tools.ffprobe)
-		return tools, nil
-	}
-
-	urls, err := mediaToolURLs()
-	if err != nil {
-		return mediaTools{}, err
-	}
-	tools, err := mediaToolCachePaths()
-	if err != nil {
-		return mediaTools{}, err
-	}
-	if err := os.MkdirAll(filepath.Dir(tools.ffmpeg), 0o755); err != nil {
-		return mediaTools{}, err
-	}
-
-	logf(stdout, "No ffmpeg tools found locally; downloading for %s/%s.", runtime.GOOS, runtime.GOARCH)
-	logf(stdout, "Downloading ffmpeg from %s", urls.ffmpeg)
-	if err := downloadExecutable(urls.ffmpeg, tools.ffmpeg); err != nil {
-		return mediaTools{}, fmt.Errorf("download ffmpeg: %w", err)
-	}
-	logf(stdout, "Installed ffmpeg at %s", tools.ffmpeg)
-	logf(stdout, "Downloading ffprobe from %s", urls.ffprobe)
-	if err := downloadExecutable(urls.ffprobe, tools.ffprobe); err != nil {
-		return mediaTools{}, fmt.Errorf("download ffprobe: %w", err)
-	}
-	logf(stdout, "Installed ffprobe at %s", tools.ffprobe)
-	return tools, nil
-}
-
-func bundledMediaTools() (mediaTools, bool) {
+func registerExecutableDir(stdout io.Writer) error {
 	exe, err := os.Executable()
 	if err != nil {
-		return mediaTools{}, false
+		return err
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(exe)
+	logf(stdout, "Registering executable directory in PATH: %s", dir)
+
+	if runtime.GOOS == "windows" {
+		return registerWindowsPath(dir, stdout)
+	}
+	return registerShellPath(dir, stdout)
+}
+
+func registerShellPath(dir string, stdout io.Writer) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	profile := shellProfilePath(home)
+	block := shellPathBlock(dir)
+
+	content, err := os.ReadFile(profile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	updated, changed := upsertMarkedBlock(string(content), "subtrans register", block)
+	if !changed {
+		logf(stdout, "PATH registration already present in %s", profile)
+		return nil
+	}
+	if err := os.WriteFile(profile, []byte(updated), 0o644); err != nil {
+		return err
+	}
+	logf(stdout, "Updated %s", profile)
+	logf(stdout, "Open a new terminal, or run: source %s", profile)
+	return nil
+}
+
+func shellProfilePath(home string) string {
+	shell := filepath.Base(os.Getenv("SHELL"))
+	switch shell {
+	case "zsh":
+		return filepath.Join(home, ".zshrc")
+	case "bash":
+		if runtime.GOOS == "darwin" {
+			return filepath.Join(home, ".bash_profile")
+		}
+		return filepath.Join(home, ".bashrc")
+	default:
+		if runtime.GOOS == "darwin" {
+			return filepath.Join(home, ".zshrc")
+		}
+		return filepath.Join(home, ".profile")
+	}
+}
+
+func shellPathBlock(dir string) string {
+	return fmt.Sprintf("export PATH=%s:$PATH\n", shellQuote(dir))
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func upsertMarkedBlock(content, name, block string) (string, bool) {
+	start := "# >>> " + name + " >>>"
+	end := "# <<< " + name + " <<<"
+	desired := start + "\n" + block + end + "\n"
+
+	startIndex := strings.Index(content, start)
+	endIndex := strings.Index(content, end)
+	if startIndex >= 0 && endIndex > startIndex {
+		endIndex += len(end)
+		if endIndex < len(content) && content[endIndex] == '\n' {
+			endIndex++
+		}
+		if content[startIndex:endIndex] == desired {
+			return content, false
+		}
+		return content[:startIndex] + desired + content[endIndex:], true
+	}
+
+	if strings.Contains(content, block) {
+		return content, false
+	}
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	if content != "" {
+		content += "\n"
+	}
+	return content + desired, true
+}
+
+func registerWindowsPath(dir string, stdout io.Writer) error {
+	current, err := currentWindowsUserPath()
+	if err != nil {
+		return err
+	}
+	entries := splitWindowsPath(current)
+	for _, entry := range entries {
+		if strings.EqualFold(filepath.Clean(entry), filepath.Clean(dir)) {
+			logf(stdout, "PATH registration already present in the Windows user environment.")
+			return nil
+		}
+	}
+	entries = append(entries, dir)
+	updated := strings.Join(entries, ";")
+
+	cmd := exec.Command("reg", "add", `HKCU\Environment`, "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", updated, "/f")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("reg add failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	logf(stdout, "Updated Windows user PATH.")
+	logf(stdout, "Open a new terminal for the PATH change to take effect.")
+	return nil
+}
+
+func currentWindowsUserPath() (string, error) {
+	cmd := exec.Command("reg", "query", `HKCU\Environment`, "/v", "Path")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", nil
+	}
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && strings.EqualFold(fields[0], "Path") {
+			return strings.Join(fields[2:], " "), nil
+		}
+	}
+	return "", nil
+}
+
+func splitWindowsPath(value string) []string {
+	raw := strings.Split(value, ";")
+	entries := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		entry = strings.TrimSpace(entry)
+		if entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
+func resolveFFmpeg(stdout io.Writer) (string, error) {
+	logf(stdout, "Resolving ffmpeg...")
+	if path, ok := bundledFFmpeg(); ok {
+		logf(stdout, "Using bundled ffmpeg: %s", path)
+		return path, nil
+	}
+	cachePath, err := ffmpegCachePath()
+	if err != nil {
+		return "", err
+	}
+	if executableExists(cachePath) {
+		if validFFmpeg(cachePath) {
+			logf(stdout, "Using cached ffmpeg: %s", cachePath)
+			return cachePath, nil
+		}
+		logf(stdout, "Cached ffmpeg is not runnable; deleting it and downloading a fresh copy: %s", cachePath)
+		_ = os.Remove(cachePath)
+	} else {
+		logf(stdout, "Cached ffmpeg not found: %s", cachePath)
+	}
+	sourceURL, err := ffmpegURL()
+	if err != nil {
+		if path, pathErr := exec.LookPath("ffmpeg"); pathErr == nil {
+			logf(stdout, "Automatic ffmpeg download is unavailable for this platform; using ffmpeg from PATH: %s", path)
+			return path, nil
+		}
+		return "", err
+	}
+	destination := cachePath
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return "", err
+	}
+
+	logf(stdout, "No ffmpeg found locally; downloading once for %s/%s.", runtime.GOOS, runtime.GOARCH)
+	logf(stdout, "Downloading ffmpeg from %s", sourceURL)
+	if err := downloadExecutable(sourceURL, destination); err != nil {
+		return "", fmt.Errorf("download ffmpeg: %w", err)
+	}
+	if !validFFmpeg(destination) {
+		_ = os.Remove(destination)
+		return "", fmt.Errorf("downloaded ffmpeg is not runnable: %s", destination)
+	}
+	logf(stdout, "Installed ffmpeg at %s; future runs will reuse this cached copy.", destination)
+	return destination, nil
+}
+
+func bundledFFmpeg() (string, bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", false
 	}
 	exeDir := filepath.Dir(exe)
 	for _, dir := range []string{filepath.Join(exeDir, "ffmpeg"), filepath.Join(exeDir, "bin"), exeDir} {
-		tools := mediaTools{
-			ffmpeg:  filepath.Join(dir, executableName("ffmpeg")),
-			ffprobe: filepath.Join(dir, executableName("ffprobe")),
-		}
-		if tools.exist() {
-			return tools, true
+		path := filepath.Join(dir, executableName("ffmpeg"))
+		if executableExists(path) {
+			return path, true
 		}
 	}
-	return mediaTools{}, false
-}
-
-func cachedMediaTools() (mediaTools, bool) {
-	tools, err := mediaToolCachePaths()
-	if err != nil {
-		return mediaTools{}, false
-	}
-	return tools, tools.exist()
-}
-
-func pathMediaTools() (mediaTools, error) {
-	ffmpegPath, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		return mediaTools{}, err
-	}
-	ffprobePath, err := exec.LookPath("ffprobe")
-	if err != nil {
-		return mediaTools{}, err
-	}
-	return mediaTools{ffmpeg: ffmpegPath, ffprobe: ffprobePath}, nil
-}
-
-func (t mediaTools) exist() bool {
-	return executableExists(t.ffmpeg) && executableExists(t.ffprobe)
+	return "", false
 }
 
 func executableExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
+}
+
+func validFFmpeg(path string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "-version")
+	return cmd.Run() == nil
 }
 
 func executableName(name string) string {
@@ -292,28 +425,22 @@ func executableName(name string) string {
 	return name
 }
 
-func mediaToolCachePaths() (mediaTools, error) {
+func ffmpegCachePath() (string, error) {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return mediaTools{}, err
+		return "", err
 	}
 	toolDir := filepath.Join(cacheDir, "subtrans", "ffmpeg", ffmpegStaticVersion, runtime.GOOS+"-"+runtime.GOARCH)
-	return mediaTools{
-		ffmpeg:  filepath.Join(toolDir, executableName("ffmpeg")),
-		ffprobe: filepath.Join(toolDir, executableName("ffprobe")),
-	}, nil
+	return filepath.Join(toolDir, executableName("ffmpeg")), nil
 }
 
-func mediaToolURLs() (mediaTools, error) {
+func ffmpegURL() (string, error) {
 	platform, err := ffmpegStaticPlatform()
 	if err != nil {
-		return mediaTools{}, err
+		return "", err
 	}
 	base := "https://github.com/descriptinc/ffmpeg-ffprobe-static/releases/download/" + ffmpegStaticVersion
-	return mediaTools{
-		ffmpeg:  base + "/ffmpeg-" + platform,
-		ffprobe: base + "/ffprobe-" + platform,
-	}, nil
+	return base + "/ffmpeg-" + platform, nil
 }
 
 func ffmpegStaticPlatform() (string, error) {
@@ -418,7 +545,7 @@ func isVideo(path string) bool {
 	return videoExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
-func processVideo(video string, opts options, translator translateClient, tools mediaTools, stdout io.Writer) error {
+func processVideo(video string, opts options, translator translateClient, ffmpegPath string, stdout io.Writer) error {
 	output := subtitleOutputPath(video, opts.targetLang)
 	logf(stdout, "Output subtitle path: %s", output)
 	if !opts.overwrite {
@@ -430,17 +557,8 @@ func processVideo(video string, opts options, translator translateClient, tools 
 		}
 	}
 
-	logf(stdout, "Probing subtitle streams...")
-	streams, err := subtitleStreams(video, tools)
-	if err != nil {
-		return err
-	}
-	if len(streams) == 0 {
-		return errors.New("no subtitle tracks found")
-	}
-	logf(stdout, "Found %d subtitle stream(s): %s", len(streams), streamList(streams))
-
-	extracted, stream, err := extractFirstUsableSubtitle(video, streams, opts.minSize, tools, stdout)
+	logf(stdout, "Extracting first usable subtitle track...")
+	extracted, track, err := extractFirstUsableSubtitle(video, opts.minSize, ffmpegPath, stdout)
 	if err != nil {
 		return err
 	}
@@ -460,7 +578,7 @@ func processVideo(video string, opts options, translator translateClient, tools 
 	}
 	logf(stdout, "Parsed %d subtitle cue(s).", len(cues))
 
-	logf(stdout, "Translating with subtitle stream #%d (%s).", stream.Index, streamDescription(stream))
+	logf(stdout, "Translating with subtitle track %d.", track)
 	if err := translateCues(context.Background(), translator, cues, stdout); err != nil {
 		return err
 	}
@@ -482,37 +600,36 @@ func subtitleOutputPath(video, lang string) string {
 	return base + "." + suffix + ".srt"
 }
 
-func subtitleStreams(video string, tools mediaTools) ([]probeStream, error) {
-	cmd := exec.Command(tools.ffprobe, "-v", "error", "-print_format", "json", "-show_streams", "-select_streams", "s", video)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("ffprobe failed: %w", err)
-	}
-	var result probeResult
-	if err := json.Unmarshal(out, &result); err != nil {
-		return nil, fmt.Errorf("parse ffprobe output: %w", err)
-	}
-	return result.Streams, nil
-}
-
-func extractFirstUsableSubtitle(video string, streams []probeStream, minSize int64, tools mediaTools, stdout io.Writer) (string, probeStream, error) {
+func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, stdout io.Writer) (string, int, error) {
+	const maxSubtitleTracks = 64
 	var lastErr error
-	for _, stream := range streams {
-		logf(stdout, "Trying subtitle stream #%d (%s).", stream.Index, streamDescription(stream))
+	for track := 0; track < maxSubtitleTracks; track++ {
+		logf(stdout, "Trying subtitle track %d.", track)
 		tmp, err := os.CreateTemp("", "subtrans-*.srt")
 		if err != nil {
-			return "", probeStream{}, err
+			return "", 0, err
 		}
 		tmpPath := tmp.Name()
 		_ = tmp.Close()
 
-		cmd := exec.Command(tools.ffmpeg, "-y", "-v", "error", "-i", video, "-map", "0:"+strconv.Itoa(stream.Index), "-c:s", "srt", tmpPath)
+		cmd := exec.Command(ffmpegPath, "-y", "-v", "error", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
 			_ = os.Remove(tmpPath)
-			lastErr = fmt.Errorf("stream #%d extraction failed: %w: %s", stream.Index, err, strings.TrimSpace(stderr.String()))
-			logf(stdout, "Stream #%d extraction failed; trying next subtitle stream.", stream.Index)
+			message := strings.TrimSpace(stderr.String())
+			if strings.Contains(message, "matches no streams") || strings.Contains(message, "Stream map") {
+				if track == 0 {
+					return "", 0, errors.New("no subtitle tracks found")
+				}
+				logf(stdout, "No subtitle track %d found; stopping subtitle search.", track)
+				break
+			}
+			if strings.Contains(message, "Error opening input") || strings.Contains(message, "Invalid data found when processing input") {
+				return "", 0, fmt.Errorf("ffmpeg could not read input: %s", message)
+			}
+			lastErr = fmt.Errorf("subtitle track %d extraction failed: %w: %s", track, err, message)
+			logf(stdout, "Subtitle track %d extraction failed; trying next subtitle track.", track)
 			continue
 		}
 
@@ -524,42 +641,17 @@ func extractFirstUsableSubtitle(video string, streams []probeStream, minSize int
 		}
 		if info.Size() <= minSize {
 			_ = os.Remove(tmpPath)
-			lastErr = fmt.Errorf("stream #%d extracted subtitle too small (%d bytes)", stream.Index, info.Size())
-			logf(stdout, "Stream #%d extracted %d bytes, below min-size %d; trying next subtitle stream.", stream.Index, info.Size(), minSize)
+			lastErr = fmt.Errorf("subtitle track %d extracted subtitle too small (%d bytes)", track, info.Size())
+			logf(stdout, "Subtitle track %d extracted %d bytes, below min-size %d; trying next subtitle track.", track, info.Size(), minSize)
 			continue
 		}
-		logf(stdout, "Selected subtitle stream #%d; extracted %d bytes.", stream.Index, info.Size())
-		return tmpPath, stream, nil
+		logf(stdout, "Selected subtitle track %d; extracted %d bytes.", track, info.Size())
+		return tmpPath, track, nil
 	}
 	if lastErr != nil {
-		return "", probeStream{}, fmt.Errorf("no usable subtitle track found: %w", lastErr)
+		return "", 0, fmt.Errorf("no usable subtitle track found: %w", lastErr)
 	}
-	return "", probeStream{}, errors.New("no usable subtitle track found")
-}
-
-func streamList(streams []probeStream) string {
-	parts := make([]string, 0, len(streams))
-	for _, stream := range streams {
-		parts = append(parts, fmt.Sprintf("#%d %s", stream.Index, streamDescription(stream)))
-	}
-	return strings.Join(parts, ", ")
-}
-
-func streamDescription(stream probeStream) string {
-	values := []string{}
-	if stream.CodecName != "" {
-		values = append(values, "codec="+stream.CodecName)
-	}
-	if lang := stream.Tags["language"]; lang != "" {
-		values = append(values, "lang="+lang)
-	}
-	if title := stream.Tags["title"]; title != "" {
-		values = append(values, "title="+title)
-	}
-	if len(values) == 0 {
-		return "unknown metadata"
-	}
-	return strings.Join(values, " ")
+	return "", 0, errors.New("no usable subtitle track found")
 }
 
 func parseSRT(input string) ([]cue, error) {
