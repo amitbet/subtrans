@@ -34,7 +34,9 @@ subtrans -recursive=false ~/Movies
 subtrans --register
 ```
 
-The graphical window shows timestamped progress logs while it scans, resolves cached `ffmpeg`, extracts subtitles, translates batches, and writes output files. Use `--cli` to run without the graphical window.
+The graphical window shows timestamped progress logs while it scans, resolves cached `ffmpeg`, extracts subtitles, translates batches, and writes output files. You can also drag video files or folders onto the window; dropped files are processed in place and the translated `.srt` is saved alongside each video. Use `--cli` to run without the graphical window.
+
+Existing target subtitles are skipped by default. For example, if `Movie.heb.srt` already exists, `Movie.mkv` is not processed again unless `-overwrite` is set.
 
 Use `subtrans --register` once to add the executable's directory to your user PATH so future terminals can run `subtrans` from any directory.
 

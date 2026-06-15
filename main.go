@@ -100,6 +100,8 @@ func runGUI(args []string) {
 
 	status := widget.NewLabel("Running...")
 	status.TextStyle = fyne.TextStyle{Bold: true}
+	hint := widget.NewLabel("Drop video files or folders here to process them. Existing target subtitles are skipped unless -overwrite is set.")
+	hint.Wrapping = fyne.TextWrapWord
 
 	progress := widget.NewProgressBarInfinite()
 	logs := widget.NewMultiLineEntry()
@@ -113,7 +115,7 @@ func runGUI(args []string) {
 	closeButton.Disable()
 
 	content := container.NewBorder(
-		container.NewVBox(status, progress),
+		container.NewVBox(status, hint, progress),
 		container.NewHBox(closeButton),
 		nil,
 		nil,
@@ -122,24 +124,103 @@ func runGUI(args []string) {
 	window.SetContent(content)
 
 	writer := newGUILogWriter(logs)
-	done := make(chan int, 1)
-	go func() {
-		done <- run(args, writer, writer)
-	}()
-	go func() {
-		code := <-done
+	processing := make(chan struct{}, 1)
+	startRun := func(runFunc func() int) {
+		select {
+		case processing <- struct{}{}:
+		default:
+			_, _ = writer.Write([]byte("Already processing; drop ignored until the current run finishes.\n"))
+			return
+		}
 		fyne.Do(func() {
-			progress.Stop()
-			if code == 0 {
-				status.SetText("Completed successfully")
-			} else {
-				status.SetText(fmt.Sprintf("Completed with errors (exit code %d)", code))
-			}
-			closeButton.Enable()
+			status.SetText("Running...")
+			progress.Start()
+			closeButton.Disable()
 		})
-	}()
+		go func() {
+			code := runFunc()
+			fyne.Do(func() {
+				progress.Stop()
+				if code == 0 {
+					status.SetText("Completed successfully")
+				} else {
+					status.SetText(fmt.Sprintf("Completed with errors (exit code %d)", code))
+				}
+				closeButton.Enable()
+			})
+			<-processing
+		}()
+	}
+	window.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
+		paths := droppedPaths(uris)
+		if len(paths) == 0 {
+			_, _ = writer.Write([]byte("Drop ignored; no local video file or folder was found.\n"))
+			return
+		}
+		opts, err := parseOptions(args)
+		if err != nil {
+			_, _ = writer.Write([]byte(fmt.Sprintf("Drop ignored; current options are invalid: %v\n", err)))
+			return
+		}
+		startRun(func() int {
+			failures := 0
+			for _, path := range paths {
+				if code := run(argsForPath(opts, path), writer, writer); code != 0 {
+					failures++
+				}
+			}
+			if failures > 0 {
+				return 1
+			}
+			return 0
+		})
+	})
 
+	startRun(func() int {
+		return run(args, writer, writer)
+	})
 	window.ShowAndRun()
+}
+
+func droppedPaths(uris []fyne.URI) []string {
+	paths := make([]string, 0, len(uris))
+	for _, uri := range uris {
+		if uri.Scheme() != "file" {
+			continue
+		}
+		path := uri.Path()
+		if runtime.GOOS == "windows" && len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+			path = path[1:]
+		}
+		path = filepath.FromSlash(path)
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() || isVideo(path) {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func argsForPath(opts options, path string) []string {
+	args := []string{
+		"-lang", opts.targetLang,
+		"-source", opts.sourceLang,
+		"-min-size", strconv.FormatInt(opts.minSize, 10),
+		"-timeout", opts.timeout.String(),
+	}
+	if !opts.recursive {
+		args = append(args, "-recursive=false")
+	}
+	if opts.overwrite {
+		args = append(args, "-overwrite")
+	}
+	return append(args, path)
 }
 
 type guiLogWriter struct {
