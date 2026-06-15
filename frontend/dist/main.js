@@ -2,10 +2,13 @@ const statusText = document.getElementById("status-text");
 const spinner = document.getElementById("spinner");
 const queueList = document.getElementById("queue-list");
 const queueCount = document.getElementById("queue-count");
+const toggleBtn = document.getElementById("toggle-btn");
 const logs = document.getElementById("logs");
 
 let queue = [];
 let activePath = null;
+let running = false;
+let paused = false;
 
 function basename(path) {
   return String(path).split(/[\\/]/).filter(Boolean).pop() || path;
@@ -28,23 +31,37 @@ function renderQueue() {
     item.title = path;
 
     if (path === activePath) {
-      item.className = "processing";
+      item.classList.add("processing");
       const dot = document.createElement("span");
       dot.className = "dot";
-      const label = document.createElement("span");
-      label.className = "name";
-      label.textContent = basename(path);
-      item.append(dot, label);
-    } else {
-      item.textContent = basename(path);
+      item.appendChild(dot);
     }
+
+    const label = document.createElement("span");
+    label.className = "name";
+    label.textContent = basename(path);
+    item.appendChild(label);
+
+    const remove = document.createElement("button");
+    remove.className = "remove";
+    remove.type = "button";
+    remove.title = "Remove from queue";
+    remove.setAttribute("aria-label", "Remove from queue");
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      window.runtime.EventsEmit("subtrans:control:remove", path);
+    });
+    item.appendChild(remove);
 
     queueList.appendChild(item);
   }
 }
 
-function setRunning(running) {
-  spinner.classList.toggle("hidden", !running);
+function updateControls() {
+  // The toggle button only makes sense while a run is active (running or paused).
+  toggleBtn.classList.toggle("hidden", !(running || paused));
+  toggleBtn.textContent = paused ? "Resume" : "Stop";
+  spinner.classList.toggle("hidden", !running || paused);
 }
 
 function appendLog(text) {
@@ -59,8 +76,18 @@ function bindRuntime() {
   }
 
   window.runtime.EventsOn("subtrans:status", (status) => {
+    // Status events only fire at run start and completion (pause uses a
+    // separate event), so either way the queue is no longer paused.
+    running = Boolean(status.running);
+    paused = false;
     statusText.textContent = status.message;
-    setRunning(Boolean(status.running));
+    updateControls();
+  });
+
+  window.runtime.EventsOn("subtrans:paused", (value) => {
+    paused = Boolean(value);
+    statusText.textContent = paused ? "Paused" : "Running...";
+    updateControls();
   });
 
   window.runtime.EventsOn("subtrans:log", (text) => {
@@ -86,6 +113,10 @@ function bindRuntime() {
     renderQueue();
   });
 
+  toggleBtn.addEventListener("click", () => {
+    window.runtime.EventsEmit("subtrans:control:toggle");
+  });
+
   window.runtime.OnFileDrop(() => {}, true);
 
   // Signal the backend that listeners are registered so it can start the
@@ -94,4 +125,5 @@ function bindRuntime() {
 }
 
 renderQueue();
+updateControls();
 bindRuntime();

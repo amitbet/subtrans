@@ -126,6 +126,99 @@ type runEvents struct {
 	setQueue     func([]string)
 	markActive   func(string)
 	removeQueued func(string)
+	control      *queueControl
+}
+
+// queueControl lets the frontend pause/resume the queue and remove individual
+// videos while runWithEvents is processing them. It is nil for the CLI path.
+type queueControl struct {
+	mu           sync.Mutex
+	cond         *sync.Cond
+	paused       bool
+	removed      map[string]bool
+	curPath      string
+	cancel       context.CancelFunc
+	cancelReason string // "pause" | "remove" | ""
+	emitRemoved  func(string)
+	emitPaused   func(bool)
+}
+
+func newQueueControl(emitRemoved func(string), emitPaused func(bool)) *queueControl {
+	q := &queueControl{
+		removed:     map[string]bool{},
+		emitRemoved: emitRemoved,
+		emitPaused:  emitPaused,
+	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// begin blocks while the queue is paused, then returns a context for processing
+// path. proceed is false when the user removed the item while it was queued.
+func (q *queueControl) begin(parent context.Context, path string) (context.Context, bool) {
+	q.mu.Lock()
+	for q.paused && !q.removed[path] {
+		q.cond.Wait()
+	}
+	if q.removed[path] {
+		q.mu.Unlock()
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(parent)
+	q.curPath = path
+	q.cancel = cancel
+	q.cancelReason = ""
+	q.mu.Unlock()
+	return ctx, true
+}
+
+// done finalizes the current item and reports why it was cancelled, if at all.
+func (q *queueControl) done() string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.cancel != nil {
+		q.cancel()
+		q.cancel = nil
+	}
+	q.curPath = ""
+	reason := q.cancelReason
+	q.cancelReason = ""
+	return reason
+}
+
+// toggle pauses or resumes the queue. Pausing cancels the in-flight video so it
+// stops promptly; it is re-processed from the start when resumed.
+func (q *queueControl) toggle() {
+	q.mu.Lock()
+	q.paused = !q.paused
+	paused := q.paused
+	if paused && q.cancel != nil {
+		q.cancelReason = "pause"
+		q.cancel()
+	}
+	q.mu.Unlock()
+	q.cond.Broadcast()
+	if q.emitPaused != nil {
+		q.emitPaused(paused)
+	}
+}
+
+// remove drops a video from the queue, cancelling it if it is the active one.
+func (q *queueControl) remove(path string) {
+	q.mu.Lock()
+	q.removed[path] = true
+	active := q.curPath == path
+	if active && q.cancel != nil {
+		q.cancelReason = "remove"
+		q.cancel()
+	}
+	q.mu.Unlock()
+	q.cond.Broadcast()
+	// A pending (not-yet-started) item is dropped from the UI immediately; the
+	// active item is reported by the processing loop once its cancel unwinds.
+	if !active && q.emitRemoved != nil {
+		q.emitRemoved(path)
+	}
 }
 
 type wailsGUI struct {
@@ -133,6 +226,14 @@ type wailsGUI struct {
 	args       []string
 	processing chan struct{}
 	startOnce  sync.Once
+	controlMu  sync.Mutex
+	control    *queueControl
+}
+
+func (g *wailsGUI) currentControl() *queueControl {
+	g.controlMu.Lock()
+	defer g.controlMu.Unlock()
+	return g.control
 }
 
 func newWailsGUI(args []string) *wailsGUI {
@@ -157,6 +258,23 @@ func (g *wailsGUI) startup(ctx context.Context) {
 				return runWithEvents(g.args, writer, writer, events)
 			})
 		})
+	})
+	wailsruntime.EventsOn(ctx, "subtrans:control:toggle", func(...interface{}) {
+		if c := g.currentControl(); c != nil {
+			c.toggle()
+		}
+	})
+	wailsruntime.EventsOn(ctx, "subtrans:control:remove", func(data ...interface{}) {
+		if len(data) == 0 {
+			return
+		}
+		path, ok := data[0].(string)
+		if !ok || path == "" {
+			return
+		}
+		if c := g.currentControl(); c != nil {
+			c.remove(path)
+		}
 	})
 }
 
@@ -195,13 +313,21 @@ func (g *wailsGUI) startRun(runFunc func(io.Writer, runEvents) int) {
 
 	g.emitStatus("Running...", true, 0)
 	writer := wailsLogWriter{emit: g.emitLog}
+	control := newQueueControl(g.emitQueueRemove, g.emitPaused)
+	g.controlMu.Lock()
+	g.control = control
+	g.controlMu.Unlock()
 	events := runEvents{
 		setQueue:     g.emitQueueSet,
 		markActive:   g.emitQueueActive,
 		removeQueued: g.emitQueueRemove,
+		control:      control,
 	}
 	go func() {
 		code := runFunc(writer, events)
+		g.controlMu.Lock()
+		g.control = nil
+		g.controlMu.Unlock()
 		if code == 0 {
 			g.emitStatus("Completed successfully", false, code)
 		} else {
@@ -234,6 +360,13 @@ func (g *wailsGUI) emitQueueSet(paths []string) {
 		return
 	}
 	wailsruntime.EventsEmit(g.ctx, "subtrans:queue:set", paths)
+}
+
+func (g *wailsGUI) emitPaused(paused bool) {
+	if g.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(g.ctx, "subtrans:paused", paused)
 }
 
 func (g *wailsGUI) emitQueueActive(path string) {
@@ -347,24 +480,60 @@ func runWithEvents(args []string, stdout, stderr io.Writer, events runEvents) in
 	}
 
 	failures := 0
-	for i, video := range videos {
-		logf(stdout, "Processing %d/%d: %s", i+1, len(videos), video)
+	parentCtx := context.Background()
+	for i := 0; i < len(videos); {
+		video := videos[i]
+
+		ctx := parentCtx
+		if events.control != nil {
+			c, proceed := events.control.begin(parentCtx, video)
+			if !proceed {
+				// Removed while queued; the UI was already updated by remove().
+				i++
+				continue
+			}
+			ctx = c
+		}
+
 		if events.markActive != nil {
 			events.markActive(video)
 		}
-		if err := processVideo(video, opts, translator, ffmpegPath, stdout); err != nil {
+		logf(stdout, "Processing %d/%d: %s", i+1, len(videos), video)
+		err := processVideo(ctx, video, opts, translator, ffmpegPath, stdout)
+
+		reason := ""
+		if events.control != nil {
+			reason = events.control.done()
+		}
+		switch reason {
+		case "pause":
+			// Don't advance: this file is re-processed when the queue resumes.
+			logf(stdout, "Paused before finishing %s; will resume this file.", filepath.Base(video))
+			continue
+		case "remove":
+			logf(stdout, "Removed %s from the queue.", filepath.Base(video))
+			if events.removeQueued != nil {
+				events.removeQueued(video)
+			}
+			i++
+			continue
+		}
+
+		if err != nil {
 			failures++
 			fmt.Fprintf(stderr, "%s: %v\n", video, err)
 			logf(stdout, "Failed %d/%d: %s", i+1, len(videos), video)
 			if events.removeQueued != nil {
 				events.removeQueued(video)
 			}
+			i++
 			continue
 		}
 		logf(stdout, "Finished %d/%d: %s", i+1, len(videos), video)
 		if events.removeQueued != nil {
 			events.removeQueued(video)
 		}
+		i++
 	}
 	if failures > 0 {
 		fmt.Fprintf(stderr, "Completed with %d failure(s).\n", failures)
@@ -793,7 +962,7 @@ func isVideo(path string) bool {
 	return videoExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
-func processVideo(video string, opts options, translator translateClient, ffmpegPath string, stdout io.Writer) error {
+func processVideo(ctx context.Context, video string, opts options, translator translateClient, ffmpegPath string, stdout io.Writer) error {
 	output := subtitleOutputPath(video, opts.targetLang)
 	logf(stdout, "Output subtitle path: %s", output)
 	if !opts.overwrite {
@@ -805,13 +974,13 @@ func processVideo(video string, opts options, translator translateClient, ffmpeg
 		}
 	}
 
-	duration := probeDuration(ffmpegPath, video)
+	duration := probeDuration(ctx, ffmpegPath, video)
 	if duration > 0 {
 		logf(stdout, "Video duration: %s.", formatDuration(duration))
 	}
 
 	logf(stdout, "Extracting first usable subtitle track...")
-	extracted, track, err := extractFirstUsableSubtitle(video, opts.minSize, ffmpegPath, duration, stdout)
+	extracted, track, err := extractFirstUsableSubtitle(ctx, video, opts.minSize, ffmpegPath, duration, stdout)
 	if err != nil {
 		return err
 	}
@@ -832,7 +1001,7 @@ func processVideo(video string, opts options, translator translateClient, ffmpeg
 	logf(stdout, "Parsed %d subtitle cue(s).", len(cues))
 
 	logf(stdout, "Translating with subtitle track %d.", track)
-	if err := translateCues(context.Background(), translator, cues, stdout); err != nil {
+	if err := translateCues(ctx, translator, cues, stdout); err != nil {
 		return err
 	}
 	logf(stdout, "Writing translated subtitle...")
@@ -853,7 +1022,7 @@ func subtitleOutputPath(video, lang string) string {
 	return base + "." + suffix + ".srt"
 }
 
-func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, total time.Duration, stdout io.Writer) (string, int, error) {
+func extractFirstUsableSubtitle(ctx context.Context, video string, minSize int64, ffmpegPath string, total time.Duration, stdout io.Writer) (string, int, error) {
 	const maxSubtitleTracks = 64
 	var lastErr error
 	for track := 0; track < maxSubtitleTracks; track++ {
@@ -865,11 +1034,14 @@ func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, 
 		tmpPath := tmp.Name()
 		_ = tmp.Close()
 
-		cmd := hiddenCommand(ffmpegPath, "-y", "-v", "error", "-progress", "pipe:1", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
+		cmd := hiddenCommandContext(ctx, ffmpegPath, "-y", "-v", "error", "-progress", "pipe:1", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := runWithProgress(cmd, track, total, stdout); err != nil {
 			_ = os.Remove(tmpPath)
+			if ctx.Err() != nil {
+				return "", 0, ctx.Err()
+			}
 			message := strings.TrimSpace(stderr.String())
 			if strings.Contains(message, "matches no streams") || strings.Contains(message, "Stream map") {
 				if track == 0 {
@@ -959,8 +1131,8 @@ func runWithProgress(cmd *exec.Cmd, track int, total time.Duration, stdout io.Wr
 // probeDuration reads the container header to determine the total runtime of
 // the video. It tolerates failure (returns 0) since duration is only used to
 // render a progress percentage.
-func probeDuration(ffmpegPath, video string) time.Duration {
-	cmd := hiddenCommand(ffmpegPath, "-hide_banner", "-i", video)
+func probeDuration(ctx context.Context, ffmpegPath, video string) time.Duration {
+	cmd := hiddenCommandContext(ctx, ffmpegPath, "-hide_banner", "-i", video)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	// ffmpeg exits non-zero here because no output file is specified; the

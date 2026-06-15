@@ -23,7 +23,12 @@
         <aside class="queue-panel">
           <div class="panel-header">
             <h2>Queue</h2>
-            <span id="queue-count">0</span>
+            <div class="queue-actions">
+              <button id="toggle-btn" class="toggle hidden" type="button">
+                Stop
+              </button>
+              <span id="queue-count">0</span>
+            </div>
           </div>
           <ul id="queue-list" class="queue-list">
             <li class="empty">No queued videos</li>

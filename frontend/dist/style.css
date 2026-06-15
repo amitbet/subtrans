@@ -157,13 +157,21 @@ h2 {
 }
 
 .queue-list li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   overflow: hidden;
-  padding: 10px 12px;
+  padding: 9px 9px 9px 12px;
   border: 1px solid rgba(148, 163, 184, 0.26);
   border-radius: 8px;
   background: #ffffff;
   color: #273244;
   line-height: 1.25;
+}
+
+.queue-list li .name {
+  flex: 1;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -175,19 +183,56 @@ h2 {
 }
 
 .queue-list li.processing {
-  display: flex;
-  align-items: center;
-  gap: 9px;
   border-color: rgba(47, 111, 237, 0.55);
   background: #eef4ff;
   color: #1d4ed8;
   font-weight: 680;
 }
 
-.queue-list li.processing .name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.remove {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.remove:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #dc2626;
+}
+
+.queue-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toggle {
+  padding: 5px 12px;
+  border: 1px solid rgba(47, 111, 237, 0.5);
+  border-radius: 999px;
+  background: #2f6fed;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 680;
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.toggle:hover {
+  background: #2056c7;
 }
 
 .queue-list li.processing .dot {
