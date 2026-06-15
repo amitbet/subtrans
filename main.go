@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"embed"
@@ -804,8 +805,13 @@ func processVideo(video string, opts options, translator translateClient, ffmpeg
 		}
 	}
 
+	duration := probeDuration(ffmpegPath, video)
+	if duration > 0 {
+		logf(stdout, "Video duration: %s.", formatDuration(duration))
+	}
+
 	logf(stdout, "Extracting first usable subtitle track...")
-	extracted, track, err := extractFirstUsableSubtitle(video, opts.minSize, ffmpegPath, stdout)
+	extracted, track, err := extractFirstUsableSubtitle(video, opts.minSize, ffmpegPath, duration, stdout)
 	if err != nil {
 		return err
 	}
@@ -847,7 +853,7 @@ func subtitleOutputPath(video, lang string) string {
 	return base + "." + suffix + ".srt"
 }
 
-func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, stdout io.Writer) (string, int, error) {
+func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, total time.Duration, stdout io.Writer) (string, int, error) {
 	const maxSubtitleTracks = 64
 	var lastErr error
 	for track := 0; track < maxSubtitleTracks; track++ {
@@ -859,10 +865,10 @@ func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, 
 		tmpPath := tmp.Name()
 		_ = tmp.Close()
 
-		cmd := hiddenCommand(ffmpegPath, "-y", "-v", "error", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
+		cmd := hiddenCommand(ffmpegPath, "-y", "-v", "error", "-progress", "pipe:1", "-i", video, "-map", "0:s:"+strconv.Itoa(track), "-c:s", "srt", tmpPath)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
+		if err := runWithProgress(cmd, track, total, stdout); err != nil {
 			_ = os.Remove(tmpPath)
 			message := strings.TrimSpace(stderr.String())
 			if strings.Contains(message, "matches no streams") || strings.Contains(message, "Stream map") {
@@ -899,6 +905,97 @@ func extractFirstUsableSubtitle(video string, minSize int64, ffmpegPath string, 
 		return "", 0, fmt.Errorf("no usable subtitle track found: %w", lastErr)
 	}
 	return "", 0, errors.New("no usable subtitle track found")
+}
+
+// runWithProgress runs an ffmpeg command whose -progress output is piped to
+// stdout, emitting a throttled log line so a long extraction shows movement
+// instead of sitting silently on "Trying subtitle track N".
+func runWithProgress(cmd *exec.Cmd, track int, total time.Duration, stdout io.Writer) error {
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scanner := bufio.NewScanner(pipe)
+		var lastLog time.Time
+		for scanner.Scan() {
+			value, ok := strings.CutPrefix(strings.TrimSpace(scanner.Text()), "out_time_us=")
+			if !ok {
+				continue
+			}
+			us, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || us < 0 {
+				continue
+			}
+			now := time.Now()
+			if now.Sub(lastLog) < 2*time.Second {
+				continue
+			}
+			lastLog = now
+			processed := time.Duration(us) * time.Microsecond
+			if total > 0 {
+				pct := float64(processed) / float64(total) * 100
+				if pct > 100 {
+					pct = 100
+				}
+				logf(stdout, "Subtitle track %d: scanned %s / %s (%.0f%%).", track, formatDuration(processed), formatDuration(total), pct)
+			} else {
+				logf(stdout, "Subtitle track %d: scanned %s.", track, formatDuration(processed))
+			}
+		}
+	}()
+
+	err = cmd.Wait()
+	<-done
+	return err
+}
+
+// probeDuration reads the container header to determine the total runtime of
+// the video. It tolerates failure (returns 0) since duration is only used to
+// render a progress percentage.
+func probeDuration(ffmpegPath, video string) time.Duration {
+	cmd := hiddenCommand(ffmpegPath, "-hide_banner", "-i", video)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	// ffmpeg exits non-zero here because no output file is specified; the
+	// duration we want is printed to stderr before it bails out.
+	_ = cmd.Run()
+	return parseFFmpegDuration(stderr.String())
+}
+
+func parseFFmpegDuration(output string) time.Duration {
+	idx := strings.Index(output, "Duration:")
+	if idx < 0 {
+		return 0
+	}
+	rest := strings.TrimSpace(output[idx+len("Duration:"):])
+	if c := strings.IndexByte(rest, ','); c >= 0 {
+		rest = rest[:c]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" || strings.HasPrefix(rest, "N/A") {
+		return 0
+	}
+	var h, m int
+	var sec float64
+	if _, err := fmt.Sscanf(rest, "%d:%d:%f", &h, &m, &sec); err != nil {
+		return 0
+	}
+	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec*float64(time.Second))
+}
+
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	total := int(d / time.Second)
+	return fmt.Sprintf("%02d:%02d:%02d", total/3600, (total%3600)/60, total%60)
 }
 
 func parseSRT(input string) ([]cue, error) {
